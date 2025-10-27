@@ -1,0 +1,332 @@
+"""Run shape completion with trained SDFusion + VQ-VAE checkpoints.
+
+All configuration such as checkpoint locations, dataset paths, sampling
+hyper-parameters, and masking ranges are intentionally hard-coded to make the
+script self-contained without relying on command-line arguments.
+"""
+
+from pathlib import Path
+from typing import Dict, Tuple
+
+import mcubes
+import torch
+import torch.nn.functional as F
+import trimesh
+
+from datasets.base_dataset import CreateDataset
+from models.base_model import create_model
+from models.networks.diffusion_networks.samplers.ddim import DDIMSampler
+from utils.demo_util import SDFusionOpt
+from utils.demo_util import get_partial_shape
+
+
+# -----------------------------------------------------------------------------
+# Hard-coded configuration
+# -----------------------------------------------------------------------------
+
+# Device & gpu setup ---------------------------------------------------------
+USE_GPU = torch.cuda.is_available()
+GPU_IDS = [0] if USE_GPU else []
+DEVICE_STR = "cuda:0" if USE_GPU else "cpu"
+
+# Paths ----------------------------------------------------------------------
+DATAROOT = "data/"  # Root directory that contains the ShapeNet SDFs
+SDFUSION_CKPT = (
+    "/nvdata/SDFusion/logs_home/2025-10/ckpt/df_steps-78000.pth"
+)  # Path to the trained diffusion checkpoint
+VQVAE_CKPT = (
+    "/nvdata/SDFusion/logs_home/2025-10-24T03-51-53-vqvae-snet-chair-res128-LR1e-4-T0.2-release/ckpt/vqvae_steps-45000.pth"
+)  # Path to the trained VQ-VAE checkpoint
+OUTPUT_DIR = Path("completion_results")
+
+# Dataset & sampling settings ------------------------------------------------
+CATEGORY = "chair"
+RESOLUTION = 128
+TRUNC_THRESHOLD = 0.2
+SAMPLE_INDEX = 0
+
+# Diffusion sampling hyper-parameters ---------------------------------------
+DDIM_STEPS = 100
+DDIM_ETA = 0.0
+UNCOND_SCALE = None  # use model default
+
+# Spatial window defining the visible (known) region of the partial shape ----
+XYZ_DICT: Dict[str, Tuple[float, float]] = {
+    "x": (-1.0, 1.0),
+    "y": (-1.0, -0.1),
+    "z": (-1.0, 1.0),
+}
+
+# Surface extraction ---------------------------------------------------------
+ISO_LEVEL = 0.02
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def _export_sdf_as_ply(sdf_tensor: torch.Tensor, out_path: Path, level: float = ISO_LEVEL) -> None:
+    """Convert a single SDF volume into a mesh and write it as a PLY file."""
+
+    volume = sdf_tensor.detach().cpu().squeeze().numpy()
+
+    if volume.ndim != 3:
+        raise ValueError(f"Expected a 3D volume, received shape {volume.shape}.")
+
+    try:
+        verts, faces = mcubes.marching_cubes(volume, level)
+    except ValueError as exc:  # pragma: no cover - mcubes raises ValueError on degenerate fields
+        raise RuntimeError(f"Marching cubes failed for {out_path}: {exc}") from exc
+
+    # Normalize vertices to [-0.5, 0.5] for compatibility with existing utilities.
+    n = volume.shape[0]
+    verts = verts / n - 0.5
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    mesh.export(out_path)
+
+
+def _prepare_options() -> SDFusionOpt:
+    """Instantiate and populate an SDFusion option object."""
+
+    opt = SDFusionOpt(gpu_ids=0)
+    opt.gpu_ids = GPU_IDS
+    opt.device = DEVICE_STR
+    opt.trunc_thres = TRUNC_THRESHOLD
+
+    opt.init_dset_args(
+        dataroot=DATAROOT,
+        dataset_mode="snet",
+        cat=CATEGORY,
+        res=RESOLUTION,
+        cached_dir=None,
+    )
+
+    opt.init_model_args(
+        ckpt_path=SDFUSION_CKPT,
+        vq_ckpt_path=VQVAE_CKPT,
+    )
+
+    return opt
+
+
+def main() -> None:
+    torch.set_grad_enabled(False)
+
+    opt = _prepare_options()
+
+    # Create model and dataset ------------------------------------------------
+    model = create_model(opt)
+    model.eval()
+    if hasattr(model, "df"):
+        model.df.eval()
+    if hasattr(model, "vqvae"):
+        model.vqvae.eval()
+
+    _, test_dataset = CreateDataset(opt)
+    sample = test_dataset[SAMPLE_INDEX]
+
+    sdf = sample["sdf"].unsqueeze(0).to(DEVICE_STR)
+    sdf = torch.clamp(sdf, min=-TRUNC_THRESHOLD, max=TRUNC_THRESHOLD)
+
+    # Run shape completion ----------------------------------------------------
+    # Encode into the latent space -------------------------------------------------
+    z = model.vqvae(sdf, forward_no_quant=True, encode_only=True)
+    if model.latent_scaling != 1.0:
+        z = z * model.latent_scaling
+
+    partial_info = get_partial_shape(sdf, xyz_dict=XYZ_DICT, z=z)
+    z_mask = partial_info["z_mask"].to(z.device)
+
+    # —— 准备 x0（就是 z 或下采样后的 z）和 mask ——
+    x0 = z  # 如果你有下采样 z_ds，这里就用 x0 = z_ds
+    # 确保 float32，省得半精度在采样里触发内核限制
+    x0 = x0.float().contiguous()
+    # 准备 mask（保持 1 通道，自动广播到 C）
+    z_mask = z_mask.to(x0.device)
+    if z_mask.dim() == 4:
+        z_mask = z_mask.unsqueeze(1)  # (B,1,*,*,*)
+    # 空间尺寸对齐到 x0
+    z_mask = torch.nn.functional.interpolate(z_mask.float(),
+                                             size=x0.shape[-3:], mode="nearest")
+    # 数值/类型/内存布局
+    z_mask = z_mask.clamp(0, 1).to(x0.dtype).contiguous()
+    # —— 强制一致性检查 ——
+    B, C, D, H, W = z.shape
+    assert z_mask.shape[0] == B, f"mask batch {z_mask.shape[0]} != {B}"
+    assert z_mask.shape[-3:] == (D, H, W), f"mask spatial {z_mask.shape[-3:]} != {(D, H, W)}"
+    assert z_mask.shape[1] in (1, C), f"mask channel must be 1 or {C}, got {z_mask.shape[1]}"
+    # 类型/设备/内存布局统一
+    z = z.float().contiguous()
+    z_mask = z_mask.to(z.device, dtype=z.dtype).contiguous()
+    # 采样的 shape 一定用 x0/z 的形状（包含 C 和 D,H,W）
+    shape_arg = (C, D, H, W)
+
+
+
+    ddim_sampler = DDIMSampler(model)
+    ddim_steps = DDIM_STEPS or model.ddim_steps
+    guidance_scale = UNCOND_SCALE if UNCOND_SCALE is not None else model.scale
+
+    samples, _ = ddim_sampler.sample(
+        S=ddim_steps,
+        batch_size=B,
+        shape=shape_arg,
+        conditioning=None,
+        verbose=False,
+        x0=z,
+        mask=z_mask,
+        unconditional_guidance_scale=guidance_scale,
+        eta=DDIM_ETA,
+    )
+
+    completed = model.decode_latents(samples)
+
+    completed = torch.clamp(completed, min=-TRUNC_THRESHOLD, max=TRUNC_THRESHOLD)
+
+    model.x_part = partial_info["shape_part"]
+    model.x_missing = partial_info["shape_missing"]
+    partial = torch.clamp(model.x_part, min=-TRUNC_THRESHOLD, max=TRUNC_THRESHOLD)
+    ground_truth = sdf
+
+    model.gen_df = completed
+
+    # Export meshes -----------------------------------------------------------
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    _export_sdf_as_ply(ground_truth[0], OUTPUT_DIR / "sample_ground_truth.ply")
+    _export_sdf_as_ply(partial[0], OUTPUT_DIR / "sample_partial.ply")
+    _export_sdf_as_ply(completed[0], OUTPUT_DIR / "sample_completion.ply")
+
+    print(f"Meshes written to: {OUTPUT_DIR.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+#!/usr/bin/env python3
+"""Utility script to inspect VQVAE reconstructions on ShapeNet SDF samples."""
+
+import argparse
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+from omegaconf import OmegaConf
+import trimesh
+
+from datasets.snet_dataset import ShapeNetDataset
+from models.networks.vqvae_networks.network import VQVAE
+from utils.util_3d import sdf_to_mesh
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Reconstruct a ShapeNet sample with a trained VQVAE")
+    parser.add_argument("--vq-config", required=True, help="Path to the VQVAE config yaml used for training")
+    parser.add_argument("--checkpoint", required=True, help="Path to the trained VQVAE checkpoint (.pth)")
+    parser.add_argument("--dataroot", required=True, help="Root directory that contains the ShapeNet SDF_v1 data")
+    parser.add_argument("--cat", default="all", help="Category name defined in info-shapenet.json")
+    parser.add_argument("--phase", default="train", choices=["train", "test"], help="Dataset split to sample from")
+    parser.add_argument("--resolution", type=int, default=64, help="SDF resolution used during preprocessing")
+    parser.add_argument("--index", type=int, default=0, help="Index of the sample to reconstruct")
+    parser.add_argument("--output-dir", default="outputs/vqvae_recon", help="Directory to store the exported meshes")
+    parser.add_argument(
+        "--trunc-thres",
+        type=float,
+        default=0.2,
+        help=(
+            "Truncation threshold applied to the SDF values. "
+            "Match the value that was used during VQVAE training (default 0.2)."
+        ),
+    )
+    parser.add_argument("--iso-level", type=float, default=0.02, help="Iso-surface level for marching cubes")
+    parser.add_argument(
+        "--max-dataset-size",
+        type=int,
+        default=2147483648,
+        help="Optional cap on dataset size (defaults to the repository training option)",
+    )
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Preferred device for inference")
+    return parser.parse_args()
+
+
+def build_dataset(args: argparse.Namespace) -> ShapeNetDataset:
+    opt = SimpleNamespace(
+        dataroot=args.dataroot,
+        max_dataset_size=args.max_dataset_size,
+        trunc_thres=args.trunc_thres,
+    )
+    dataset = ShapeNetDataset()
+    dataset.initialize(opt, phase=args.phase, cat=args.cat, res=args.resolution)
+    return dataset
+
+
+def load_vqvae(args: argparse.Namespace, device: torch.device) -> VQVAE:
+    config = OmegaConf.load(args.vq_config)
+    model_cfg = config.model.params
+    vqvae = VQVAE(model_cfg.ddconfig, model_cfg.n_embed, model_cfg.embed_dim)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    state_dict = checkpoint["vqvae"] if "vqvae" in checkpoint else checkpoint
+    vqvae.load_state_dict(state_dict)
+    vqvae.to(device)
+    vqvae.eval()
+    return vqvae
+
+
+def sdf_to_trimesh(meshes: "Meshes", output_path: Path) -> None:
+    if meshes is None:
+        raise RuntimeError("Failed to extract a mesh from the supplied SDF")
+    verts_list = meshes.verts_list()
+    faces_list = meshes.faces_list()
+    if not verts_list:
+        raise RuntimeError("Mesh extraction returned an empty vertex list")
+    mesh = trimesh.Trimesh(
+        vertices=verts_list[0].detach().cpu().numpy(),
+        faces=faces_list[0].detach().cpu().numpy(),
+        process=False,
+    )
+    mesh.export(output_path)
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    if args.device == "cuda" and device.type != "cuda":
+        print("CUDA is not available, falling back to CPU inference.")
+
+    dataset = build_dataset(args)
+    if len(dataset) == 0:
+        raise RuntimeError("Dataset is empty – please check dataroot, category, and split settings")
+    if args.index >= len(dataset):
+        raise IndexError(f"Requested index {args.index} but dataset only has {len(dataset)} samples")
+
+    sample = dataset[args.index]
+    print(f"Loaded sample from {sample['path']}")
+    sdf = sample["sdf"].unsqueeze(0).to(device)  # (1, 1, res, res, res)
+    if args.trunc_thres > 0:
+        sdf = torch.clamp(sdf, min=-args.trunc_thres, max=args.trunc_thres)
+
+    vqvae = load_vqvae(args, device)
+    with torch.no_grad():
+        recon, _ = vqvae(sdf, verbose=False)
+        if args.trunc_thres > 0:
+            recon = torch.clamp(recon, min=-args.trunc_thres, max=args.trunc_thres)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_mesh_path = output_dir / "input_mesh.ply"
+    recon_mesh_path = output_dir / "reconstruction_mesh.ply"
+
+    input_mesh = sdf_to_mesh(sdf, level=args.iso_level, render_all=True)
+    recon_mesh = sdf_to_mesh(recon, level=args.iso_level, render_all=True)
+
+    sdf_to_trimesh(input_mesh, input_mesh_path)
+    sdf_to_trimesh(recon_mesh, recon_mesh_path)
+
+    print(f"Saved input mesh to {input_mesh_path}")
+    print(f"Saved reconstructed mesh to {recon_mesh_path}")
+
+
+if __name__ == "__main__":
+    main()
