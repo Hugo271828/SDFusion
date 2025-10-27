@@ -74,6 +74,11 @@ class SDFusionModel(BaseModel):
 
         # init vqvae
         self.vqvae = load_vqvae(vq_conf, vq_ckpt=opt.vq_ckpt, opt=opt)
+
+        # latent scaling follows the autoencoder config (default: identity)
+        self.latent_scaling = float(getattr(df_conf.model.params, 'scale_factor', 1.0))
+        if self.latent_scaling == 0:
+            raise ValueError('scale_factor must be non-zero to decode latents safely.')
         ######## END: Define Networks ########
 
         if self.isTrain:
@@ -205,8 +210,11 @@ class SDFusionModel(BaseModel):
     ############################ END: init diffusion params ############################
     
     def set_input(self, input=None, max_sample=None):
-        
+
         self.x = input['sdf']
+
+        if self.opt.trunc_thres is not None and self.opt.trunc_thres > 0:
+            self.x = torch.clamp(self.x, min=-self.opt.trunc_thres, max=self.opt.trunc_thres)
 
         if max_sample is not None:
             self.x = self.x[:max_sample]
@@ -317,6 +325,8 @@ class SDFusionModel(BaseModel):
         #    encoder, quant_conv, but do not quantize
         with torch.no_grad():
             z = self.vqvae(self.x, forward_no_quant=True, encode_only=True)
+        if self.latent_scaling != 1.0:
+            z = z * self.latent_scaling
 
         # 2. do diffusion's forward
         t = torch.randint(0, self.num_timesteps, (z.shape[0],), device=self.device).long()
@@ -324,6 +334,14 @@ class SDFusionModel(BaseModel):
 
         self.loss_df = loss
         self.loss_dict = loss_dict
+
+    def decode_latents(self, latents):
+        if self.latent_scaling != 1.0:
+            latents = latents / self.latent_scaling
+        dec = self.vqvae_module.decode_no_quant(latents)
+        if self.opt.trunc_thres is not None and self.opt.trunc_thres > 0:
+            dec = torch.clamp(dec, min=-self.opt.trunc_thres, max=self.opt.trunc_thres)
+        return dec
 
     # check: ddpm.py, log_images(). line 1317~1327
     @torch.no_grad()
@@ -362,7 +380,7 @@ class SDFusionModel(BaseModel):
 
 
         # decode z
-        self.gen_df = self.vqvae_module.decode_no_quant(samples)
+        self.gen_df = self.decode_latents(samples)
 
         self.df.train()
 
@@ -392,7 +410,7 @@ class SDFusionModel(BaseModel):
 
 
         # decode z
-        self.gen_df = self.vqvae_module.decode_no_quant(samples)
+        self.gen_df = self.decode_latents(samples)
         return self.gen_df
 
     @torch.no_grad()
@@ -415,6 +433,8 @@ class SDFusionModel(BaseModel):
         # get noise, denoise, and decode with vqvae
         B = ngen
         z = self.vqvae(shape, forward_no_quant=True, encode_only=True)
+        if self.latent_scaling != 1.0:
+            z = z * self.latent_scaling
 
         # get partial shape
         ret = get_partial_shape(shape, xyz_dict=xyz_dict, z=z)
@@ -440,8 +460,8 @@ class SDFusionModel(BaseModel):
 
 
         # decode z
-        self.gen_df = self.vqvae_module.decode_no_quant(samples)
-        
+        self.gen_df = self.decode_latents(samples)
+
         return self.gen_df
 
     @torch.no_grad()
