@@ -81,6 +81,10 @@ class SDFusionText2ShapeModel(BaseModel):
         # init vqvae
         self.vqvae = load_vqvae(vq_conf, vq_ckpt=opt.vq_ckpt, opt=opt)
 
+        self.latent_scaling = float(getattr(df_conf.model.params, 'scale_factor', 1.0))
+        if self.latent_scaling == 0:
+            raise ValueError('scale_factor must be non-zero to decode latents safely.')
+
         # init cond model
         bert_params = df_conf.bert.params
         self.text_embed_dim = bert_params.n_embed
@@ -243,6 +247,9 @@ class SDFusionText2ShapeModel(BaseModel):
         
         self.x = input['sdf']
 
+        if self.opt.trunc_thres is not None and self.opt.trunc_thres > 0:
+            self.x = torch.clamp(self.x, min=-self.opt.trunc_thres, max=self.opt.trunc_thres)
+
         self.text = input['text']
         B = self.x.shape[0]
         self.uc_text = B * [""]
@@ -356,6 +363,8 @@ class SDFusionText2ShapeModel(BaseModel):
         #    check: ldm.models.autoencoder.py, VQModelInterface's encode(self, x)
         with torch.no_grad():
             z = self.vqvae(self.x, forward_no_quant=True, encode_only=True)
+        if self.latent_scaling != 1.0:
+            z = z * self.latent_scaling
 
         # 2. do diffusion's forward
         t = torch.randint(0, self.num_timesteps, (z.shape[0],), device=self.device).long()
@@ -363,6 +372,14 @@ class SDFusionText2ShapeModel(BaseModel):
 
         self.loss_df = loss
         self.loss_dict = loss_dict
+
+    def decode_latents(self, latents):
+        if self.latent_scaling != 1.0:
+            latents = latents / self.latent_scaling
+        dec = self.vqvae_module.decode_no_quant(latents)
+        if self.opt.trunc_thres is not None and self.opt.trunc_thres > 0:
+            dec = torch.clamp(dec, min=-self.opt.trunc_thres, max=self.opt.trunc_thres)
+        return dec
 
 
     # check: ddpm.py, log_images(). line 1317~1327
@@ -399,7 +416,7 @@ class SDFusionText2ShapeModel(BaseModel):
                                                      eta=ddim_eta)
         
         # decode z
-        self.gen_df = self.vqvae_module.decode_no_quant(samples)
+        self.gen_df = self.decode_latents(samples)
 
         self.switch_train()
 
@@ -438,7 +455,7 @@ class SDFusionText2ShapeModel(BaseModel):
                                                      eta=ddim_eta)
         
         # decode z
-        self.gen_df = self.vqvae_module.decode_no_quant(samples)
+        self.gen_df = self.decode_latents(samples)
         return self.gen_df
 
     @torch.no_grad()

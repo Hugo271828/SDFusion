@@ -80,6 +80,10 @@ class SDFusionImage2ShapeModel(BaseModel):
         # init vqvae
         self.vqvae = load_vqvae(vq_conf, vq_ckpt=opt.vq_ckpt, opt=opt)
 
+        self.latent_scaling = float(getattr(df_conf.model.params, 'scale_factor', 1.0))
+        if self.latent_scaling == 0:
+            raise ValueError('scale_factor must be non-zero to decode latents safely.')
+
         # init cond model
         clip_param = df_conf.clip.params
         self.cond_model = CLIPImageEncoder(model=clip_param.model)
@@ -237,6 +241,8 @@ class SDFusionImage2ShapeModel(BaseModel):
     def set_input(self, input=None, gen_order=None, max_sample=None):
         
         self.x = input['sdf']
+        if self.opt.trunc_thres is not None and self.opt.trunc_thres > 0:
+            self.x = torch.clamp(self.x, min=-self.opt.trunc_thres, max=self.opt.trunc_thres)
         self.img = input['img']
         self.uc_img = torch.zeros_like(self.img).to(self.device)
 
@@ -351,6 +357,8 @@ class SDFusionImage2ShapeModel(BaseModel):
         #    check: ldm.models.autoencoder.py, VQModelInterface's encode(self, x)
         with torch.no_grad():
             z = self.vqvae(self.x, forward_no_quant=True, encode_only=True).detach()
+        if self.latent_scaling != 1.0:
+            z = z * self.latent_scaling
 
         # 2. do diffusion's forward
         t = torch.randint(0, self.num_timesteps, (z.shape[0],), device=self.device).long()
@@ -358,6 +366,14 @@ class SDFusionImage2ShapeModel(BaseModel):
 
         self.loss_df = loss
         self.loss_dict = loss_dict
+
+    def decode_latents(self, latents):
+        if self.latent_scaling != 1.0:
+            latents = latents / self.latent_scaling
+        dec = self.vqvae_module.decode_no_quant(latents)
+        if self.opt.trunc_thres is not None and self.opt.trunc_thres > 0:
+            dec = torch.clamp(dec, min=-self.opt.trunc_thres, max=self.opt.trunc_thres)
+        return dec
 
     # check: ddpm.py, log_images(). line 1317~1327
     @torch.no_grad()
@@ -393,7 +409,7 @@ class SDFusionImage2ShapeModel(BaseModel):
                                                         quantize_x0=False)
 
 
-        self.gen_df = self.vqvae_module.decode_no_quant(samples)
+        self.gen_df = self.decode_latents(samples)
 
         self.switch_train()
 
@@ -443,7 +459,7 @@ class SDFusionImage2ShapeModel(BaseModel):
                                                         quantize_x0=False)
 
 
-        self.gen_df = self.vqvae_module.decode_no_quant(samples)
+        self.gen_df = self.decode_latents(samples)
 
         return self.gen_df
 
